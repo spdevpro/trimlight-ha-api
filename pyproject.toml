@@ -23,9 +23,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/bsholy/aiotrimlight"
-Source = "https://github.com/bsholy/aiotrimlight"
-Issues = "https://github.com/bsholy/aiotrimlight/issues"
+Homepage = "https://github.com/spdevpro/trimlight-ha-api"
+Source = "https://github.com/spdevpro/trimlight-ha-api"
+Issues = "https://github.com/spdevpro/trimlight-ha-api/issues"
 
 [dependency-groups]
 test = [
