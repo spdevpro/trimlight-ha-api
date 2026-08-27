@@ -12,10 +12,6 @@
 
 ## Installation
 
-> [!IMPORTANT]
-> `aiotrimlight` is not yet published to PyPI. The command below will work
-> after the first release.
-
 ```shell
 python -m pip install aiotrimlight
 ```
@@ -63,16 +59,6 @@ asyncio.run(main())
 Replace the example address with the controller's LAN IP address.
 
 `trust_env=False` prevents system proxy settings from routing local controller traffic through an HTTP proxy.
-
-## Protocol notes
-
-- mDNS discovery uses `_tlight._tcp.local.`.
-- The mDNS TXT `did` value is used as the stable device identifier and normalized to lowercase.
-- HTTP requests use `http://<host>:80/api/light`.
-- The mDNS SRV port belongs to the native Trimlight TCP protocol and is not used by this HTTP client.
-- `get_light_state()` reads the controller's runtime light state.
-- During effects, missing static output, or non-uniform zone output, brightness and color may be reported as `None` while switch state remains available.
-- Partial static updates are merged with the last known uniform static output.
 
 ## Development
 
