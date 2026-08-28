@@ -60,6 +60,17 @@ Replace the example address with the controller's LAN IP address.
 
 `trust_env=False` prevents system proxy settings from routing local controller traffic through an HTTP proxy.
 
+Discovery metadata exposes both the normalized DID and the full MAC address encoded
+by the firmware:
+
+```python
+from aiotrimlight import parse_discovery_properties
+
+discovery = parse_discovery_properties({"did": "544c0003020000000001"})
+print(discovery.did)  # 544c0003020000000001
+print(discovery.mac_address)  # 02:00:00:00:00:01
+```
+
 ## Development
 
 ```shell

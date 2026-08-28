@@ -15,6 +15,14 @@ def test_parse_discovery_properties() -> None:
 
     assert info.name == "Test controller"
     assert info.did == VALID_DID
+    assert info.mac_address == "a1:b2:c3:d4:e5:f6"
+
+
+def test_discovery_mac_address_ignores_product_identifier() -> None:
+    """Test deriving the MAC independently of the DID product identifier."""
+    info = parse_discovery_properties({"did": f"deadbeef{VALID_DID[-12:]}"})
+
+    assert info.mac_address == "a1:b2:c3:d4:e5:f6"
 
 
 def test_parse_discovery_properties_without_name() -> None:
