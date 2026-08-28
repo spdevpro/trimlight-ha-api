@@ -19,6 +19,12 @@ class TrimlightDiscoveryInfo:
     name: str | None
     did: str
 
+    @property
+    def mac_address(self) -> str:
+        """Return the controller MAC address encoded in the DID."""
+        mac = self.did[-12:].lower()
+        return ":".join(mac[index : index + 2] for index in range(0, 12, 2))
+
 
 @dataclass(frozen=True, slots=True)
 class TrimlightDeviceInfo:
