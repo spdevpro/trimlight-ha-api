@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -16,7 +17,14 @@ from .exceptions import (
     TrimlightProtocolError,
     TrimlightUnsupportedICError,
 )
-from .models import TrimlightDeviceInfo, TrimlightICType, TrimlightLightState
+from .models import (
+    TrimlightDeviceInfo,
+    TrimlightEffect,
+    TrimlightICType,
+    TrimlightLightState,
+    TrimlightOutputMode,
+    TrimlightZoneState,
+)
 
 _HTTP_PORT = 80
 _API_PATH = "/api/light"
@@ -86,22 +94,22 @@ class TrimlightClient:
 
     async def get_device_info(self) -> TrimlightDeviceInfo:
         """Return device metadata and light capability."""
-        response = await self._request(
-            "get_device_data",
-            {"timestamp": int(time.time())},
-        )
-        data = response.get("data")
-        if not isinstance(data, dict):
-            raise TrimlightProtocolError("response data must be an object")
-
-        sys_info = data.get("sys_info")
-        if not isinstance(sys_info, dict):
-            raise TrimlightProtocolError("sys_info must be an object")
-        firmware_version = sys_info.get("firmware_version")
-        if firmware_version is not None and not isinstance(firmware_version, str):
-            raise TrimlightProtocolError("firmware_version must be a string")
-
         async with self._state_lock:
+            response = await self._request(
+                "get_device_data",
+                {"timestamp": int(time.time())},
+            )
+            data = response.get("data")
+            if not isinstance(data, dict):
+                raise TrimlightProtocolError("response data must be an object")
+
+            sys_info = data.get("sys_info")
+            if not isinstance(sys_info, dict):
+                raise TrimlightProtocolError("sys_info must be an object")
+            firmware_version = sys_info.get("firmware_version")
+            if firmware_version is not None and not isinstance(firmware_version, str):
+                raise TrimlightProtocolError("firmware_version must be a string")
+
             runtime_state = await self._get_runtime_state()
 
         return TrimlightDeviceInfo(firmware_version, runtime_state.ic_type)
@@ -109,6 +117,45 @@ class TrimlightClient:
     async def get_light_state(self) -> TrimlightLightState:
         """Return the whole-installation state reported by the controller."""
         async with self._state_lock:
+            return (await self._get_runtime_state()).light_state
+
+    async def get_effect_list(
+        self, effect_ids: Sequence[int] | None = None
+    ) -> tuple[TrimlightEffect, ...]:
+        """Return saved scenes sorted by ID; None or an empty sequence reads all."""
+        ids = [] if effect_ids is None else list(effect_ids)
+        for effect_id in ids:
+            self._validate_effect_id(effect_id)
+
+        async with self._state_lock:
+            response = await self._request("get_effect_list", {"effect_ids": ids})
+            data = response.get("data")
+            if not isinstance(data, dict):
+                raise TrimlightProtocolError("response data must be an object")
+            effects = data.get("effects")
+            if not isinstance(effects, list):
+                raise TrimlightProtocolError("effects must be an array")
+
+            scenes: dict[int, TrimlightEffect] = {}
+            for index, effect in enumerate(effects):
+                if not isinstance(effect, dict):
+                    raise TrimlightProtocolError(f"effects[{index}] must be an object")
+                effect_id = self._parse_scene_id(effect, "id")
+                if effect_id in scenes:
+                    raise TrimlightProtocolError(f"duplicate effect id: {effect_id}")
+                name = effect.get("name")
+                if not isinstance(name, str):
+                    raise TrimlightProtocolError(
+                        f"effects[{index}].name must be a string"
+                    )
+                scenes[effect_id] = TrimlightEffect(effect_id, name)
+            return tuple(scenes[effect_id] for effect_id in sorted(scenes))
+
+    async def play_effect(self, effect_id: int) -> TrimlightLightState:
+        """Play a saved scene and read back state without implicitly switching on."""
+        self._validate_effect_id(effect_id)
+        async with self._state_lock:
+            await self._request("play_effect", {"effect_id": effect_id})
             return (await self._get_runtime_state()).light_state
 
     async def set_light_state(
@@ -155,6 +202,14 @@ class TrimlightClient:
                 await self._request("switch", {"state": 1})
 
             return (await self._get_runtime_state()).light_state
+
+    @staticmethod
+    def _validate_effect_id(value: int) -> None:
+        """Validate a caller-supplied library scene ID before sending requests."""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("effect_id must be an integer")
+        if not 1 <= value <= 120:
+            raise ValueError("effect_id must be between 1 and 120")
 
     @staticmethod
     def _validate_on(value: object | None) -> None:
@@ -208,11 +263,15 @@ class TrimlightClient:
         except ValueError as err:
             raise TrimlightUnsupportedICError(raw_ic_type) from err
 
+        scene_id = (
+            self._parse_scene_id(data, "scene_id") if "scene_id" in data else None
+        )
         records = data.get("records")
         if not isinstance(records, list):
             raise TrimlightProtocolError("records must be an array")
 
         static_outputs: list[_StaticOutput | None] = []
+        zones: list[TrimlightZoneState] = []
         for index, record in enumerate(records):
             if not isinstance(record, dict):
                 raise TrimlightProtocolError(f"records[{index}] must be an object")
@@ -234,12 +293,19 @@ class TrimlightClient:
             static_outputs.append(
                 self._parse_static_output(record, index) if output_mode == 1 else None
             )
+            zones.append(
+                TrimlightZoneState(
+                    zone_id, bool(zone_on_off), TrimlightOutputMode(output_mode)
+                )
+            )
 
-        state = TrimlightLightState(is_on=device_state != 0)
+        state = TrimlightLightState(
+            is_on=device_state != 0, scene_id=scene_id, zones=tuple(zones)
+        )
         if len(static_outputs) == 1 and (static_output := static_outputs[0]):
             self._static_output = static_output
-            state = TrimlightLightState(
-                is_on=device_state != 0,
+            state = replace(
+                state,
                 brightness=static_output.brightness,
                 red=static_output.red,
                 green=static_output.green,
@@ -249,6 +315,14 @@ class TrimlightClient:
             )
 
         return _RuntimeState(state, ic_type)
+
+    @classmethod
+    def _parse_scene_id(cls, data: dict[str, Any], name: str) -> int:
+        """Parse a library scene ID without assuming it still exists in the library."""
+        value = cls._parse_integer(data, name)
+        if not 1 <= value <= 120:
+            raise TrimlightProtocolError(f"{name} must be between 1 and 120")
+        return value
 
     @classmethod
     def _parse_static_output(

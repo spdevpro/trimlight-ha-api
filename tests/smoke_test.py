@@ -9,6 +9,9 @@ PUBLIC_EXPORTS = {
     "TrimlightDeviceInfo",
     "TrimlightDiscoveryInfo",
     "TrimlightLightState",
+    "TrimlightEffect",
+    "TrimlightOutputMode",
+    "TrimlightZoneState",
     "parse_discovery_properties",
 }
 
@@ -22,6 +25,15 @@ def main() -> None:
 
     discovery = aiotrimlight.parse_discovery_properties({"did": "544c0003020000000001"})
     assert discovery.mac_address == "02:00:00:00:00:01"
+    assert callable(aiotrimlight.TrimlightClient.get_effect_list)
+    assert callable(aiotrimlight.TrimlightClient.play_effect)
+    scene = aiotrimlight.TrimlightEffect(1, "Scene")
+    zone = aiotrimlight.TrimlightZoneState(
+        1, True, aiotrimlight.TrimlightOutputMode.EFFECT
+    )
+    state = aiotrimlight.TrimlightLightState(scene_id=scene.id, zones=(zone,))
+    assert state.scene_id == 1
+    assert state.zones == (zone,)
 
 
 if __name__ == "__main__":

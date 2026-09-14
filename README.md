@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/spdevpro/trimlight-ha-api/actions/workflows/ci.yml/badge.svg)](https://github.com/spdevpro/trimlight-ha-api/actions/workflows/ci.yml)
 
-`aiotrimlight` is an asynchronous Python client for the Trimlight V3 local HTTP API. It provides device metadata, runtime light state, and high-level power, brightness, and static color control.
+`aiotrimlight` is an asynchronous Python client for the Trimlight Edge Pro local HTTP API. It provides device metadata, runtime light state, high-level power, brightness and static color control, and saved scene queries and playback.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ For source development:
 
 ```shell
 git clone https://github.com/spdevpro/trimlight-ha-api.git
-cd aiotrimlight
+cd trimlight-ha-api
 uv sync --locked --group test --python 3.14
 ```
 

@@ -12,6 +12,31 @@ class TrimlightICType(IntEnum):
     RGBCW = 2
 
 
+class TrimlightOutputMode(IntEnum):
+    """Numeric output mode reported for a zone."""
+
+    EFFECT = 0
+    STATIC = 1
+    NONE = 2
+
+
+@dataclass(frozen=True, slots=True)
+class TrimlightEffect:
+    """Saved library scene identity, not a zone's internal effect preset."""
+
+    id: int
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class TrimlightZoneState:
+    """Reported zone output, independent of the device power state."""
+
+    zone_id: int
+    output_enabled: bool
+    output_mode: TrimlightOutputMode
+
+
 @dataclass(frozen=True, slots=True)
 class TrimlightDiscoveryInfo:
     """Identity advertised by Trimlight mDNS discovery."""
@@ -45,3 +70,5 @@ class TrimlightLightState:
     blue: int | None = None
     warm_white: int | None = None
     cold_white: int | None = None
+    scene_id: int | None = None
+    zones: tuple[TrimlightZoneState, ...] = ()

@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+from dataclasses import replace
 from json import JSONDecodeError
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
@@ -17,8 +18,10 @@ from aiotrimlight import (
     TrimlightHTTPError,
     TrimlightICType,
     TrimlightLightState,
+    TrimlightOutputMode,
     TrimlightProtocolError,
     TrimlightUnsupportedICError,
+    TrimlightZoneState,
 )
 
 HOST = "192.0.2.10"
@@ -117,6 +120,7 @@ async def test_get_light_state_reads_uniform_static_output(
         blue=3,
         warm_white=4,
         cold_white=5,
+        zones=(TrimlightZoneState(255, True, TrimlightOutputMode.STATIC),),
     )
     assert post.await_args.kwargs["json"] == {
         "cmd": "get_runtime_state",
@@ -163,7 +167,9 @@ async def test_get_light_state_returns_unknown_color(
     """Test non-uniform runtime output has no aggregate static color."""
     client, _ = make_client(runtime_response(records=records))
 
-    assert await client.get_light_state() == TrimlightLightState(is_on=True)
+    state = await client.get_light_state()
+    assert replace(state, zones=()) == TrimlightLightState(is_on=True)
+    assert len(state.zones) == len(records)
 
 
 @pytest.mark.parametrize(
@@ -242,6 +248,7 @@ async def test_set_light_state_uses_static_output_switch_and_readback() -> None:
         blue=3,
         warm_white=4,
         cold_white=5,
+        zones=(TrimlightZoneState(255, True, TrimlightOutputMode.STATIC),),
     )
     assert [call.kwargs["json"] for call in post.await_args_list] == [
         {

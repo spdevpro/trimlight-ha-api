@@ -14,8 +14,11 @@ from .exceptions import (
 from .models import (
     TrimlightDeviceInfo,
     TrimlightDiscoveryInfo,
+    TrimlightEffect,
     TrimlightICType,
     TrimlightLightState,
+    TrimlightOutputMode,
+    TrimlightZoneState,
 )
 
 __all__ = [
@@ -25,11 +28,14 @@ __all__ = [
     "TrimlightDeviceInfo",
     "TrimlightDiscoveryError",
     "TrimlightDiscoveryInfo",
+    "TrimlightEffect",
     "TrimlightError",
     "TrimlightHTTPError",
     "TrimlightICType",
     "TrimlightLightState",
+    "TrimlightOutputMode",
     "TrimlightProtocolError",
     "TrimlightUnsupportedICError",
+    "TrimlightZoneState",
     "parse_discovery_properties",
 ]
