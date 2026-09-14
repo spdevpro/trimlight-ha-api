@@ -1,11 +1,8 @@
-"""Saved scene contracts, using captured TASK 2 data and labeled simulations."""
+"""Saved scene contracts using minimal synthetic data, never device captures."""
 
 import asyncio
-import json
 from collections.abc import Sequence
-from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
-from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
@@ -27,63 +24,81 @@ from aiotrimlight import (
 )
 
 
-@pytest.fixture(scope="module")
-def observations() -> dict[str, dict[str, Any]]:
-    """Load independent, unmodified response samples captured during TASK 2."""
-    payload = json.loads(
-        Path(__file__).with_name("fixtures").joinpath("task2_scenes.json").read_text()
-    )
-    return {item["label"]: item for item in payload["observations"]}
-
-
 def effect_response(*effects: object) -> Mock:
     """Build a synthetic list response, including a truly empty full library."""
     return make_response({"code": 0, "data": {"effects": list(effects)}})
 
 
-def scene_response(scene_id: object = 1) -> Mock:
+def effect_record(
+    zone_id: int = 1, *, enabled: int = 1, brightness: int = 40
+) -> dict[str, Any]:
+    """Build a minimal synthetic effect record with an unrelated preset ID."""
+    return {
+        "zone_id": zone_id,
+        "zone_on_off": enabled,
+        "output_mode": 0,
+        "effect": {"effect_id": 95, "brightness": brightness},
+    }
+
+
+def scene_response(
+    scene_id: object = 1,
+    *,
+    device_state: int = 1,
+    records: list[dict[str, Any]] | None = None,
+) -> Mock:
     """Build synthetic scene state for boundary and concurrency tests."""
     return make_response(
         {
             "code": 0,
             "data": {
-                "device_state": 1,
+                "device_state": device_state,
                 "ic": 0,
                 "scene_id": scene_id,
-                "records": [{"zone_id": 1, "zone_on_off": 1, "output_mode": 0}],
+                "records": [effect_record()] if records is None else records,
             },
         }
     )
 
 
 @pytest.mark.parametrize(
-    ("label", "ids", "expected_ids"),
+    ("ids", "returned_ids"),
     [
-        ("initial_effect_list", None, list(range(1, 16))),
-        ("initial_effect_list", [], list(range(1, 16))),
-        ("effect_list_filtered", (1, 5), [1, 5]),
-        ("effect_list_absent_id", [120], []),
+        pytest.param(None, [7, 3], id="all-default"),
+        pytest.param([], [7, 3], id="all-empty-filter"),
+        pytest.param((3, 7), [7, 3], id="filtered"),
+        pytest.param([120], [], id="absent-id"),
     ],
 )
-async def test_captured_lists(
-    observations: dict[str, dict[str, Any]],
-    label: str,
+async def test_effect_list_queries(
     ids: Sequence[int] | None,
-    expected_ids: list[int],
+    returned_ids: list[int],
 ) -> None:
     """Use library IDs, never the nested zone preset IDs."""
-    sample = observations[label]
-    client, post = make_client(make_response(sample["response"]))
+    client, post = make_client(
+        effect_response(
+            *[
+                {
+                    "id": effect_id,
+                    "name": f"Scene {effect_id}",
+                    "zones": [{"zone_id": 255, "effect_id": 95}],
+                }
+                for effect_id in returned_ids
+            ]
+        )
+    )
     effects = await client.get_effect_list(ids)
     assert isinstance(effects, tuple)
-    assert [effect.id for effect in effects] == expected_ids
     assert effects == tuple(
-        TrimlightEffect(effect["id"], effect["name"])
-        for effect in sample["response"]["data"]["effects"]
+        TrimlightEffect(effect_id, f"Scene {effect_id}")
+        for effect_id in sorted(returned_ids)
     )
-    assert post.await_args_list[0].kwargs["json"] == sample["request"]
-    if label == "effect_list_filtered":
-        assert sample["response"]["data"]["effects"][0]["zones"][0]["effect_id"] != 1
+    assert [call.kwargs["json"] for call in post.await_args_list] == [
+        {
+            "cmd": "get_effect_list",
+            "data": {"effect_ids": [] if ids is None else list(ids)},
+        }
+    ]
 
 
 async def test_names_sorting_and_empty_library() -> None:
@@ -162,40 +177,51 @@ async def test_invalid_response_ids(value: object) -> None:
 
 
 @pytest.mark.parametrize(
-    "label",
+    ("device_state", "records"),
     [
-        "initial_runtime",
-        "off_static_runtime",
-        "after_play_while_off_runtime",
-        "on_effect_runtime",
-        "mixed_runtime",
-        "single_zone_4_runtime",
-        "app_a_connected_runtime",
-        "app_a_preview_runtime",
-        "app_a_overwrite_runtime",
-        "app_b_saved_runtime",
-        "app_cleanup_runtime",
+        pytest.param(1, [static_record()], id="static-on"),
+        pytest.param(0, [static_record()], id="static-off"),
+        pytest.param(0, [effect_record()], id="effect-off"),
+        pytest.param(1, [effect_record()], id="effect-on"),
+        pytest.param(2, [effect_record()], id="effect-timer"),
+        pytest.param(
+            1,
+            [effect_record(), static_record(zone_id=2), effect_record(4)],
+            id="mixed-zones",
+        ),
+        pytest.param(1, [static_record(zone_id=4)], id="zone-four-is-not-bitmask"),
+        pytest.param(1, [effect_record(), effect_record(4)], id="multiple-effects"),
+        pytest.param(1, [effect_record(enabled=0)], id="disabled-effect"),
+        pytest.param(
+            1, [{"zone_id": 255, "zone_on_off": 1, "output_mode": 2}], id="no-output"
+        ),
+        pytest.param(1, [], id="no-records"),
     ],
 )
-async def test_captured_runtime(
-    observations: dict[str, dict[str, Any]], label: str
+async def test_runtime_association_and_zones(
+    device_state: int, records: list[dict[str, Any]]
 ) -> None:
-    """Expose numeric per-zone state and raw association across real transitions."""
-    payload = deepcopy(observations[label]["response"])
-    data = payload["data"]
-    for record in data["records"]:
-        record["output_mode_desc"] = "deliberately wrong: numeric mode wins"
-    client, post = make_client(make_response(payload))
+    """Numeric zone fields win over descriptions, independently of association."""
+    client, post = make_client(
+        scene_response(
+            7,
+            device_state=device_state,
+            records=[
+                {**record, "output_mode_desc": "deliberately wrong"}
+                for record in records
+            ],
+        )
+    )
     state = await client.get_light_state()
-    assert state.scene_id == data["scene_id"]
-    assert state.is_on == (data["device_state"] != 0)
+    assert state.scene_id == 7
+    assert state.is_on == (device_state != 0)
     assert state.zones == tuple(
         TrimlightZoneState(
             record["zone_id"],
             bool(record["zone_on_off"]),
             TrimlightOutputMode(record["output_mode"]),
         )
-        for record in data["records"]
+        for record in records
     )
     if (
         len(state.zones) != 1
@@ -206,33 +232,63 @@ async def test_captured_runtime(
             == TrimlightLightState()
         )
     else:
-        assert state.brightness == data["records"][0]["static_output"]["brightness"]
-    assert post.await_count == 1
+        assert state.brightness == records[0]["static_output"]["brightness"]
+    assert [call.kwargs["json"] for call in post.await_args_list] == [
+        {"cmd": "get_runtime_state", "data": {"zone_id": 255}}
+    ]
 
 
 @pytest.mark.parametrize(
-    ("prefix", "expected_id"),
+    ("scene_id", "library_ids", "runtime_brightness", "saved_brightness"),
     [
-        ("app_a_connected", 16),
-        ("app_a_preview", 16),
-        ("app_a_overwrite", 16),
-        ("app_b_saved", 17),
-        ("app_cleanup", 17),
+        pytest.param(3, [3], 40, 40, id="selected"),
+        pytest.param(3, [3], 80, 40, id="unsaved-preview"),
+        pytest.param(3, [3], 80, 80, id="overwrite"),
+        pytest.param(7, [3, 7], 80, 80, id="save-as"),
+        pytest.param(7, [3], 80, 40, id="deleted-association"),
     ],
 )
-async def test_app_transitions_and_deleted_id(
-    observations: dict[str, dict[str, Any]], prefix: str, expected_id: int
+async def test_scene_transitions_and_deleted_id(
+    scene_id: int,
+    library_ids: list[int],
+    runtime_brightness: int,
+    saved_brightness: int,
 ) -> None:
-    """Captured preview/save/delete transitions keep raw association separate."""
+    """Simulate App transitions without inferring association from effect parameters."""
     client, _ = make_client(
-        make_response(observations[f"{prefix}_list"]["response"]),
-        make_response(observations[f"{prefix}_runtime"]["response"]),
+        effect_response({"id": 3, "name": "Scene 3"}),
+        scene_response(3),
+        effect_response(
+            *[
+                {
+                    "id": effect_id,
+                    "name": f"Scene {effect_id}",
+                    "zones": [
+                        {
+                            "zone_id": 255,
+                            "effect_id": 95,
+                            "brightness": saved_brightness,
+                        }
+                    ],
+                }
+                for effect_id in library_ids
+            ]
+        ),
+        scene_response(
+            scene_id, records=[effect_record(brightness=runtime_brightness)]
+        ),
     )
+    assert await client.get_effect_list() == (TrimlightEffect(3, "Scene 3"),)
+    assert (await client.get_light_state()).scene_id == 3
     effects = await client.get_effect_list()
     state = await client.get_light_state()
-    assert state.scene_id == expected_id
-    assert (expected_id in {effect.id for effect in effects}) == (
-        prefix != "app_cleanup"
+    assert effects == tuple(
+        TrimlightEffect(effect_id, f"Scene {effect_id}") for effect_id in library_ids
+    )
+    assert state == TrimlightLightState(
+        is_on=True,
+        scene_id=scene_id,
+        zones=(TrimlightZoneState(1, True, TrimlightOutputMode.EFFECT),),
     )
 
 
@@ -266,14 +322,12 @@ async def test_play_uses_readback_not_requested_id(effect_id: int) -> None:
     ]
 
 
-async def test_play_while_off_and_static_cache(
-    observations: dict[str, dict[str, Any]],
-) -> None:
-    """Captured effect output does not turn on or overwrite remembered channels."""
+async def test_play_while_off_and_static_cache() -> None:
+    """Synthetic effect output does not turn on or overwrite remembered channels."""
     client, post = make_client(
         runtime_response(records=[static_record(red=22)]),
         make_response(),
-        make_response(observations["after_play_while_off_runtime"]["response"]),
+        scene_response(device_state=0),
         make_response(),
         runtime_response(),
     )
