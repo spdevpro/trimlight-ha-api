@@ -33,14 +33,5 @@ class TrimlightCommandError(TrimlightError):
         super().__init__(f"controller returned error code {code}{detail}")
 
 
-class TrimlightUnsupportedICError(TrimlightError):
-    """Raised when a controller reports an unknown light IC."""
-
-    def __init__(self, ic_type: int) -> None:
-        """Initialize the error."""
-        self.ic_type = ic_type
-        super().__init__(f"light IC {ic_type} is not supported")
-
-
 class TrimlightDiscoveryError(TrimlightError):
     """Raised when mDNS discovery properties are invalid."""

@@ -8,7 +8,12 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from aiohttp import ClientConnectionError, ClientResponse, ClientSession
+from aiohttp import (
+    ClientConnectionError,
+    ClientPayloadError,
+    ClientResponse,
+    ClientSession,
+)
 from yarl import URL
 
 from aiotrimlight import (
@@ -20,7 +25,6 @@ from aiotrimlight import (
     TrimlightLightState,
     TrimlightOutputMode,
     TrimlightProtocolError,
-    TrimlightUnsupportedICError,
     TrimlightZoneState,
 )
 
@@ -210,16 +214,14 @@ async def test_get_device_info_uses_runtime_ic(
 
 
 async def test_get_device_info_rejects_unknown_runtime_ic() -> None:
-    """Test rejecting an unsupported light IC reported at runtime."""
+    """Test rejecting an invalid light IC reported at runtime."""
     client, _ = make_client(
         make_response({"code": 0, "data": {"sys_info": {"firmware_version": "1.2.3"}}}),
         runtime_response(ic=3),
     )
 
-    with pytest.raises(TrimlightUnsupportedICError) as error:
+    with pytest.raises(TrimlightProtocolError, match="ic must be 0, 1, or 2"):
         await client.get_device_info()
-
-    assert error.value.ic_type == 3
 
 
 async def test_set_light_state_uses_static_output_switch_and_readback() -> None:
@@ -479,6 +481,31 @@ async def test_connection_errors(side_effect: Exception, message: str) -> None:
 
     with pytest.raises(TrimlightConnectionError, match=message):
         await client.get_light_state()
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "message"),
+    [
+        pytest.param(TimeoutError(), "request timed out", id="timeout"),
+        pytest.param(
+            ClientPayloadError("response payload is not completed"),
+            "request failed",
+            id="payload",
+        ),
+    ],
+)
+async def test_response_body_connection_errors(
+    side_effect: Exception, message: str
+) -> None:
+    """Test response body transport failures become library connection errors."""
+    response = make_response()
+    response.json.side_effect = side_effect
+    client, _ = make_client(response)
+
+    with pytest.raises(TrimlightConnectionError, match=message):
+        await client.get_light_state()
+
+    response.release.assert_called_once_with()
 
 
 async def test_http_error() -> None:

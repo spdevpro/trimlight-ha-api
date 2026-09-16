@@ -15,7 +15,6 @@ from .exceptions import (
     TrimlightConnectionError,
     TrimlightHTTPError,
     TrimlightProtocolError,
-    TrimlightUnsupportedICError,
 )
 from .models import (
     TrimlightDeviceInfo,
@@ -261,7 +260,7 @@ class TrimlightClient:
         try:
             ic_type = TrimlightICType(raw_ic_type)
         except ValueError as err:
-            raise TrimlightUnsupportedICError(raw_ic_type) from err
+            raise TrimlightProtocolError("ic must be 0, 1, or 2") from err
 
         scene_id = (
             self._parse_scene_id(data, "scene_id") if "scene_id" in data else None
@@ -385,6 +384,10 @@ class TrimlightClient:
             self._raise_for_http_status(response)
             try:
                 result = await response.json(content_type=None)
+            except TimeoutError as err:
+                raise TrimlightConnectionError("request timed out") from err
+            except ClientError as err:
+                raise TrimlightConnectionError("request failed") from err
             except (json.JSONDecodeError, UnicodeDecodeError) as err:
                 raise TrimlightProtocolError("response is not valid JSON") from err
         finally:
