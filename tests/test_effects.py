@@ -125,7 +125,8 @@ async def test_names_sorting_and_empty_library() -> None:
     assert await client.get_effect_list() == (TrimlightEffect(1, "Renamed"),)
     assert await client.get_effect_list() == ()
     assert (await client.get_light_state()).scene_id == 120
-    assert not (await client.set_light_state(on=False)).is_on
+    await client.set_light_state(on=False)
+    assert not (await client.get_light_state()).is_on
 
 
 @pytest.mark.parametrize("value", [None, True, "1", 1.5, 0, -1, 121])
@@ -312,10 +313,12 @@ async def test_missing_scene_id_and_disabled_zones() -> None:
 
 
 @pytest.mark.parametrize("effect_id", [1, 120])
-async def test_play_uses_readback_not_requested_id(effect_id: int) -> None:
-    """Synthetic differing readback is returned without list lookup or guessing."""
+async def test_play_and_explicit_query(effect_id: int) -> None:
+    """Commands have no implicit query; explicit reads remain authoritative."""
     client, post = make_client(make_response(), scene_response(2))
-    assert (await client.play_effect(effect_id)).scene_id == 2
+    await client.play_effect(effect_id)
+    assert post.await_count == 1
+    assert (await client.get_light_state()).scene_id == 2
     assert [call.kwargs["json"] for call in post.await_args_list] == [
         {"cmd": "play_effect", "data": {"effect_id": effect_id}},
         {"cmd": "get_runtime_state", "data": {"zone_id": 255}},
@@ -332,7 +335,8 @@ async def test_play_while_off_and_static_cache() -> None:
         runtime_response(),
     )
     await client.get_light_state()
-    state = await client.play_effect(1)
+    await client.play_effect(1)
+    state = await client.get_light_state()
     assert not state.is_on
     assert state.scene_id == 1
     await client.set_light_state(green=33)
@@ -368,7 +372,8 @@ async def test_command_failure_preserves_basic_control(
             await client.play_effect(1)
     assert error.value.code == code
     assert post.await_count == 1
-    assert not (await client.set_light_state(on=False)).is_on
+    await client.set_light_state(on=False)
+    assert not (await client.get_light_state()).is_on
 
 
 @pytest.mark.parametrize("phase", ["command", "readback"])
@@ -389,6 +394,7 @@ async def test_play_failure_and_recovery(phase: str, failure: str) -> None:
     ]
     with pytest.raises(error):
         await client.play_effect(1)
+        await client.get_light_state()
     assert post.await_count == (2 if phase == "readback" else 1)
     assert (await client.get_light_state()).scene_id == 2
 
@@ -407,12 +413,9 @@ async def call_operation(client: TrimlightClient, operation: str) -> None:
         await client.get_light_state()
 
 
-@pytest.mark.parametrize("blocked_request", [1, 2])
 @pytest.mark.parametrize("operation", ["list", "info", "set", "play", "state"])
-async def test_play_and_readback_are_atomic(
-    blocked_request: int, operation: str
-) -> None:
-    """No public operation can insert HTTP requests inside playback/readback."""
+async def test_play_serializes_with_other_operations(operation: str) -> None:
+    """All public operations share the lock, without implicit playback queries."""
     entered = asyncio.Event()
     release = asyncio.Event()
     requests: list[str] = []
@@ -420,7 +423,7 @@ async def test_play_and_readback_are_atomic(
     async def send(_url: URL, **kwargs: Any) -> Mock:
         command = kwargs["json"]["cmd"]
         requests.append(command)
-        if len(requests) == blocked_request:
+        if len(requests) == 1:
             entered.set()
             await release.wait()
         if command == "get_runtime_state":
@@ -439,14 +442,14 @@ async def test_play_and_readback_are_atomic(
         second = asyncio.create_task(call_operation(client, operation))
         try:
             await asyncio.sleep(0)
-            assert len(requests) == blocked_request
+            assert requests == ["play_effect"]
         finally:
             release.set()
             await asyncio.gather(first, second)
-    assert requests[:2] == ["play_effect", "get_runtime_state"]
+    assert requests[0] == "play_effect"
 
 
-@pytest.mark.parametrize("cancel_during", ["command", "readback", "waiting"])
+@pytest.mark.parametrize("cancel_during", ["command", "waiting"])
 async def test_play_cancellation_releases_lock(cancel_during: str) -> None:
     """Cancellation at either I/O or while queued cannot strand the client lock."""
     entered = asyncio.Event()
@@ -457,7 +460,7 @@ async def test_play_cancellation_releases_lock(cancel_during: str) -> None:
     async def send(_url: URL, **kwargs: Any) -> Mock:
         command = kwargs["json"]["cmd"]
         requests.append(command)
-        if len(requests) == (2 if cancel_during == "readback" else 1):
+        if len(requests) == 1:
             entered.set()
             await release.wait()
         return scene_response() if command == "get_runtime_state" else make_response()

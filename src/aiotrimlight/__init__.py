@@ -1,4 +1,4 @@
-"""Asynchronous Trimlight V3 HTTP client."""
+"""Asynchronous Trimlight Edge Pro HTTP client."""
 
 from .client import TrimlightClient
 from .discovery import parse_discovery_properties

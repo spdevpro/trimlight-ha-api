@@ -1,4 +1,4 @@
-"""Trimlight mDNS discovery parsing."""
+"""Trimlight Edge Pro mDNS discovery parsing."""
 
 import re
 from collections.abc import Mapping

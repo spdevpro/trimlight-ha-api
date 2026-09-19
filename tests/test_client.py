@@ -1,11 +1,10 @@
 """Tests for the Trimlight HTTP client."""
 
 import asyncio
-import inspect
 from dataclasses import replace
 from json import JSONDecodeError
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from aiohttp import (
@@ -13,7 +12,9 @@ from aiohttp import (
     ClientPayloadError,
     ClientResponse,
     ClientSession,
+    web,
 )
+from aiohttp.test_utils import TestServer
 from yarl import URL
 
 from aiotrimlight import (
@@ -37,7 +38,8 @@ def make_response(
     status: int = 200,
 ) -> Mock:
     """Create a mocked aiohttp response."""
-    response = Mock(spec=ClientResponse)
+    response = MagicMock(spec=ClientResponse)
+    response.__aenter__.return_value = response
     response.status = status
     response.json = AsyncMock(return_value={"code": 0} if payload is None else payload)
     return response
@@ -97,6 +99,25 @@ def make_client(*responses: Mock) -> tuple[TrimlightClient, AsyncMock]:
     post = AsyncMock(side_effect=responses)
     session.post = post
     return TrimlightClient(HOST, cast(ClientSession, session)), post
+
+
+def blocked_client(
+    first_response: Mock | None = None,
+) -> tuple[TrimlightClient, AsyncMock, asyncio.Event, asyncio.Event]:
+    """Block the first HTTP response while concurrent calls enter the client."""
+    response = make_response() if first_response is None else first_response
+    payload = response.json.return_value
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(*, content_type: str | None) -> object:
+        entered.set()
+        await release.wait()
+        return payload
+
+    response.json.side_effect = blocked
+    client, post = make_client(response, *(make_response() for _ in range(6)))
+    return client, post, entered, release
 
 
 @pytest.mark.parametrize(
@@ -224,15 +245,42 @@ async def test_get_device_info_rejects_unknown_runtime_ic() -> None:
         await client.get_device_info()
 
 
-async def test_set_light_state_uses_static_output_switch_and_readback() -> None:
+async def test_empty_state_command_makes_no_requests() -> None:
+    """An empty command does not trigger an implicit state query."""
+    client, post = make_client()
+    await client.set_light_state()
+    post.assert_not_awaited()
+
+
+async def test_cancelled_state_query_releases_lock() -> None:
+    """Cancelling an explicit query does not strand subsequent network calls."""
+    client, post = make_client()
+    entered = asyncio.Event()
+
+    async def blocked(_url: URL, **kwargs: object) -> Mock:
+        entered.set()
+        await asyncio.Event().wait()
+        return runtime_response()
+
+    post.side_effect = blocked
+    task = asyncio.create_task(client.get_light_state())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    post.side_effect = [runtime_response()]
+    assert (await client.get_light_state()).is_on
+    assert post.await_count == 2
+
+
+async def test_set_light_state_uses_static_output_and_switch_without_query() -> None:
     """Test the exact whole-installation static ON request sequence."""
     client, post = make_client(
         make_response(),
         make_response(),
-        runtime_response(),
     )
 
-    state = await client.set_light_state(
+    await client.set_light_state(
         on=True,
         brightness=64,
         red=1,
@@ -242,16 +290,6 @@ async def test_set_light_state_uses_static_output_switch_and_readback() -> None:
         cold_white=5,
     )
 
-    assert state == TrimlightLightState(
-        is_on=True,
-        brightness=64,
-        red=1,
-        green=2,
-        blue=3,
-        warm_white=4,
-        cold_white=5,
-        zones=(TrimlightZoneState(255, True, TrimlightOutputMode.STATIC),),
-    )
     assert [call.kwargs["json"] for call in post.await_args_list] == [
         {
             "cmd": "set_static_output",
@@ -266,7 +304,6 @@ async def test_set_light_state_uses_static_output_switch_and_readback() -> None:
             },
         },
         {"cmd": "switch", "data": {"state": 1}},
-        {"cmd": "get_runtime_state", "data": {"zone_id": 255}},
     ]
     request_url = post.await_args_list[0].args[0]
     assert request_url.host == HOST
@@ -295,7 +332,6 @@ async def test_set_light_state_switch_only(
 
     assert [call.kwargs["json"] for call in post.await_args_list] == [
         {"cmd": "switch", "data": {"state": expected_state}},
-        {"cmd": "get_runtime_state", "data": {"zone_id": 255}},
     ]
 
 
@@ -408,10 +444,6 @@ async def test_state_updates_are_serialized() -> None:
         if len(requests) == 1:
             first_entered.set()
             await release_first.wait()
-        if request_json["cmd"] == "get_runtime_state":
-            red = 10
-            green = 20 if len(requests) == 4 else 255
-            return runtime_response(records=[static_record(red=red, green=green)])
         return make_response()
 
     session = Mock(spec=ClientSession)
@@ -424,15 +456,232 @@ async def test_state_updates_are_serialized() -> None:
     release_first.set()
     await asyncio.gather(first, second)
 
-    assert requests[2]["data"] == {
+    assert len(requests) == 2
+    assert requests[1]["data"] == {
         "zone_id": 255,
-        "brightness": 64,
+        "brightness": 255,
         "red": 10,
         "green": 20,
+        "blue": 255,
+        "warm_white": 0,
+        "cold_white": 0,
+    }
+
+
+async def test_pending_updates_merge_fields_and_send_only_latest() -> None:
+    """A running write completes, and only the merged latest target is sent."""
+    client, post, entered, release = blocked_client()
+    first = asyncio.create_task(client.set_light_state(on=True, red=10))
+    await entered.wait()
+    second = asyncio.create_task(
+        client.set_light_state(on=False, brightness=0, green=20, warm_white=40)
+    )
+    await asyncio.sleep(0)
+    third = asyncio.create_task(client.set_light_state(blue=30, cold_white=50))
+    await asyncio.sleep(0)
+    latest = asyncio.create_task(client.set_light_state(on=True, green=0))
+    await asyncio.sleep(0)
+    await client.set_light_state()
+    with pytest.raises(ValueError, match="red"):
+        await client.set_light_state(red=-1)
+    assert post.await_count == 1
+    release.set()
+    await asyncio.gather(first, second, third, latest)
+
+    assert [call.kwargs["json"] for call in post.await_args_list] == [
+        {
+            "cmd": "set_static_output",
+            "data": {
+                "zone_id": 255,
+                "brightness": 255,
+                "red": 10,
+                "green": 255,
+                "blue": 255,
+                "warm_white": 0,
+                "cold_white": 0,
+            },
+        },
+        {"cmd": "switch", "data": {"state": 1}},
+        {
+            "cmd": "set_static_output",
+            "data": {
+                "zone_id": 255,
+                "brightness": 0,
+                "red": 10,
+                "green": 0,
+                "blue": 30,
+                "warm_white": 40,
+                "cold_white": 50,
+            },
+        },
+        {"cmd": "switch", "data": {"state": 1}},
+    ]
+
+
+async def test_pending_power_uses_latest_explicit_value() -> None:
+    """Superseded power-only calls do not generate intermediate switches."""
+    client, post, entered, release = blocked_client()
+    first = asyncio.create_task(client.set_light_state(red=10))
+    await entered.wait()
+    on = asyncio.create_task(client.set_light_state(on=True))
+    await asyncio.sleep(0)
+    off = asyncio.create_task(client.set_light_state(on=False))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, on, off)
+    assert post.await_count == 2
+    assert post.await_args_list[1].kwargs["json"] == {
+        "cmd": "switch",
+        "data": {"state": 0},
+    }
+
+
+async def test_pending_update_uses_completed_readback() -> None:
+    """A query remains real I/O and seeds omitted channels before the write."""
+    client, post, entered, release = blocked_client(runtime_response())
+    query = asyncio.create_task(client.get_light_state())
+    await entered.wait()
+    brightness = asyncio.create_task(client.set_light_state(brightness=0))
+    await asyncio.sleep(0)
+    color = asyncio.create_task(client.set_light_state(red=20))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(query, brightness, color)
+    assert post.await_count == 2
+    assert post.await_args_list[1].kwargs["json"]["data"] == {
+        "zone_id": 255,
+        "brightness": 0,
+        "red": 20,
+        "green": 2,
         "blue": 3,
         "warm_white": 4,
         "cold_white": 5,
     }
+
+
+async def test_failed_inflight_write_does_not_strand_pending_target() -> None:
+    """A failed active write releases the lock without caching its values."""
+    client, post, entered, release = blocked_client(make_response({"code": 201}))
+    first = asyncio.create_task(client.set_light_state(red=10))
+    await entered.wait()
+    latest = asyncio.create_task(client.set_light_state(green=20))
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(TrimlightCommandError):
+        await first
+    await latest
+    assert post.await_count == 2
+    assert post.await_args_list[1].kwargs["json"]["data"]["red"] == 255
+    assert post.await_args_list[1].kwargs["json"]["data"]["green"] == 20
+
+
+async def test_failed_pending_batch_is_not_replayed() -> None:
+    """A failed merged write neither changes the cache nor leaks into later calls."""
+    response = make_response()
+    client, post, entered, release = blocked_client(response)
+    post.side_effect = [response, make_response({"code": 201}), make_response()]
+    first = asyncio.create_task(client.set_light_state(red=10))
+    await entered.wait()
+    older = asyncio.create_task(client.set_light_state(brightness=0))
+    await asyncio.sleep(0)
+    latest = asyncio.create_task(client.set_light_state(green=20))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, older)
+    with pytest.raises(TrimlightCommandError):
+        await latest
+    assert post.await_count == 2
+    await client.set_light_state(blue=30)
+    assert post.await_args_list[2].kwargs["json"]["data"] == {
+        "zone_id": 255,
+        "brightness": 255,
+        "red": 10,
+        "green": 255,
+        "blue": 30,
+        "warm_white": 0,
+        "cold_white": 0,
+    }
+
+
+async def test_cancel_latest_waiter_discards_unsent_batch() -> None:
+    """Canceling the latest waiter never revives superseded writes or fields."""
+    client, post, entered, release = blocked_client()
+    first = asyncio.create_task(client.set_light_state(red=10))
+    await entered.wait()
+    older = asyncio.create_task(client.set_light_state(brightness=0))
+    await asyncio.sleep(0)
+    latest = asyncio.create_task(client.set_light_state(green=20))
+    await asyncio.sleep(0)
+    latest.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await latest
+    release.set()
+    await asyncio.gather(first, older)
+    assert post.await_count == 1
+    await client.set_light_state(blue=30)
+    assert post.await_args_list[1].kwargs["json"]["data"] == {
+        "zone_id": 255,
+        "brightness": 255,
+        "red": 10,
+        "green": 255,
+        "blue": 30,
+        "warm_white": 0,
+        "cold_white": 0,
+    }
+
+
+async def test_cancel_older_waiter_preserves_merged_latest_target() -> None:
+    """Older cancellation does not clear the newer batch it contributed to."""
+    client, post, entered, release = blocked_client()
+    first = asyncio.create_task(client.set_light_state(red=10))
+    await entered.wait()
+    older = asyncio.create_task(client.set_light_state(brightness=0))
+    await asyncio.sleep(0)
+    latest = asyncio.create_task(client.set_light_state(green=20))
+    await asyncio.sleep(0)
+    older.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await older
+    release.set()
+    await asyncio.gather(first, latest)
+    assert post.await_count == 2
+    assert post.await_args_list[1].kwargs["json"]["data"]["brightness"] == 0
+    assert post.await_args_list[1].kwargs["json"]["data"]["green"] == 20
+
+
+async def test_cancel_inflight_write_releases_pending_target() -> None:
+    """Canceling an active write does not cancel or replay the newer target."""
+    response = make_response()
+    client, post, entered, _ = blocked_client(response)
+    first = asyncio.create_task(client.set_light_state(red=10))
+    await entered.wait()
+    latest = asyncio.create_task(client.set_light_state(green=20))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await latest
+    response.__aexit__.assert_awaited_once()
+    assert post.await_count == 2
+    assert post.await_args_list[1].kwargs["json"]["data"]["red"] == 255
+    assert post.await_args_list[1].kwargs["json"]["data"]["green"] == 20
+
+
+async def test_pending_targets_are_per_client() -> None:
+    """One controller's pending updates never replace another's target."""
+    client, post, entered, release = blocked_client()
+    other, other_post = make_client(make_response())
+    first = asyncio.create_task(client.set_light_state(red=10))
+    await entered.wait()
+    latest = asyncio.create_task(client.set_light_state(green=20))
+    await asyncio.sleep(0)
+    await other.set_light_state(blue=30)
+    release.set()
+    await asyncio.gather(first, latest)
+    assert post.await_count == 2
+    assert other_post.await_count == 1
+    assert other_post.await_args is not None
+    assert other_post.await_args.kwargs["json"]["data"]["green"] == 255
 
 
 @pytest.mark.parametrize(
@@ -505,19 +754,44 @@ async def test_response_body_connection_errors(
     with pytest.raises(TrimlightConnectionError, match=message):
         await client.get_light_state()
 
-    response.release.assert_called_once_with()
+    response.__aexit__.assert_awaited_once()
 
 
-async def test_http_error() -> None:
+@pytest.mark.parametrize("status", [199, 302, 503])
+async def test_http_error(status: int) -> None:
     """Test a non-success HTTP response."""
-    response = make_response(status=503)
+    response = make_response(status=status)
     client, _ = make_client(response)
 
     with pytest.raises(TrimlightHTTPError) as error:
         await client.get_light_state()
 
-    assert error.value.status == 503
-    response.release.assert_called_once_with()
+    assert error.value.status == status
+    response.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.parametrize("raise_for_status", [False, True])
+async def test_http_error_ignores_session_raise_for_status(
+    monkeypatch: pytest.MonkeyPatch, raise_for_status: bool
+) -> None:
+    """Keep HTTP error classification independent of the shared session policy."""
+
+    async def unavailable(request: web.Request) -> web.Response:
+        return web.Response(status=503)
+
+    app = web.Application()
+    app.router.add_post("/api/light", unavailable)
+    async with (
+        TestServer(app) as server,
+        ClientSession(raise_for_status=raise_for_status) as session,
+    ):
+        monkeypatch.setattr("aiotrimlight.client._HTTP_PORT", server.port)
+        client = TrimlightClient(server.host, session)
+
+        with pytest.raises(TrimlightHTTPError) as error:
+            await client.set_light_state(on=True)
+
+        assert error.value.status == 503
 
 
 async def test_invalid_json() -> None:
@@ -686,8 +960,3 @@ def test_client_builds_ipv6_url() -> None:
 
     assert client.host == "2001:db8::1"
     assert str(client.url) == "http://[2001:db8::1]/api/light"
-
-
-def test_client_no_longer_uses_preview_effect() -> None:
-    """Test the v1 preview adapter is absent from the client."""
-    assert "preview_effect" not in inspect.getsource(TrimlightClient)
