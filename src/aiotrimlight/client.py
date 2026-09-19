@@ -1,4 +1,4 @@
-"""Trimlight V3 HTTP client."""
+"""Trimlight Edge Pro HTTP client."""
 
 import asyncio
 import json
@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from aiohttp import ClientError, ClientResponse, ClientSession, ClientTimeout
+from aiohttp import ClientError, ClientSession, ClientTimeout
 from yarl import URL
 
 from .exceptions import (
@@ -52,7 +52,7 @@ class _RuntimeState:
 
 
 class TrimlightClient:
-    """Asynchronous client for a Trimlight V3 controller."""
+    """Asynchronous client for a Trimlight Edge Pro controller."""
 
     def __init__(
         self,
@@ -80,6 +80,7 @@ class TrimlightClient:
         )
         self._static_output = _StaticOutput()
         self._state_lock = asyncio.Lock()
+        self._pending_state: dict[str, int] | None = None
 
     @property
     def host(self) -> str:
@@ -150,12 +151,11 @@ class TrimlightClient:
                 scenes[effect_id] = TrimlightEffect(effect_id, name)
             return tuple(scenes[effect_id] for effect_id in sorted(scenes))
 
-    async def play_effect(self, effect_id: int) -> TrimlightLightState:
-        """Play a saved scene and read back state without implicitly switching on."""
+    async def play_effect(self, effect_id: int) -> None:
+        """Play a saved scene without switching on or querying runtime state."""
         self._validate_effect_id(effect_id)
         async with self._state_lock:
             await self._request("play_effect", {"effect_id": effect_id})
-            return (await self._get_runtime_state()).light_state
 
     async def set_light_state(
         self,
@@ -167,8 +167,8 @@ class TrimlightClient:
         blue: int | None = None,
         warm_white: int | None = None,
         cold_white: int | None = None,
-    ) -> TrimlightLightState:
-        """Set whole-installation static output and switch state."""
+    ) -> None:
+        """Set static output and power, coalescing unsent concurrent changes."""
         self._validate_on(on)
         values = {
             "brightness": brightness,
@@ -181,26 +181,38 @@ class TrimlightClient:
         for name, value in values.items():
             self._validate_channel(name, value)
 
-        async with self._state_lock:
-            changes = {
-                name: value for name, value in values.items() if value is not None
-            }
-            static_output = replace(self._static_output, **changes)
+        changes = {name: value for name, value in values.items() if value is not None}
+        if on is not None:
+            changes["on"] = on
+        if not changes:
+            return
 
-            if on is False:
-                await self._request("switch", {"state": 0})
+        pending = (self._pending_state or {}) | changes
+        self._pending_state = pending
+        try:
+            async with self._state_lock:
+                if self._pending_state is not pending:
+                    return
+                self._pending_state = None
+                power = pending.pop("on", None)
 
-            if changes:
-                await self._request(
-                    "set_static_output",
-                    self._static_output_data(static_output),
-                )
-                self._static_output = static_output
+                if power is False:
+                    await self._request("switch", {"state": 0})
 
-            if on is True:
-                await self._request("switch", {"state": 1})
+                if pending:
+                    static_output = replace(self._static_output, **pending)
+                    await self._request(
+                        "set_static_output",
+                        self._static_output_data(static_output),
+                    )
+                    self._static_output = static_output
 
-            return (await self._get_runtime_state()).light_state
+                if power is True:
+                    await self._request("switch", {"state": 1})
+        finally:
+            # Canceling the latest waiter discards its unsent batch.
+            if self._pending_state is pending:
+                self._pending_state = None
 
     @staticmethod
     def _validate_effect_id(value: int) -> None:
@@ -284,19 +296,19 @@ class TrimlightClient:
                 raise TrimlightProtocolError(
                     f"records[{index}].zone_on_off must be 0 or 1"
                 )
-            output_mode = self._parse_integer(record, "output_mode")
-            if output_mode not in (0, 1, 2):
+            raw_output_mode = self._parse_integer(record, "output_mode")
+            try:
+                output_mode = TrimlightOutputMode(raw_output_mode)
+            except ValueError as err:
                 raise TrimlightProtocolError(
                     f"records[{index}].output_mode must be 0, 1, or 2"
-                )
+                ) from err
             static_outputs.append(
-                self._parse_static_output(record, index) if output_mode == 1 else None
+                self._parse_static_output(record, index)
+                if output_mode is TrimlightOutputMode.STATIC
+                else None
             )
-            zones.append(
-                TrimlightZoneState(
-                    zone_id, bool(zone_on_off), TrimlightOutputMode(output_mode)
-                )
-            )
+            zones.append(TrimlightZoneState(zone_id, bool(zone_on_off), output_mode))
 
         state = TrimlightLightState(
             is_on=device_state != 0, scene_id=scene_id, zones=tuple(zones)
@@ -374,24 +386,18 @@ class TrimlightClient:
                 self._url,
                 json=payload,
                 timeout=self._timeout,
+                raise_for_status=False,
             )
+            async with response:
+                if not 200 <= response.status < 300:
+                    raise TrimlightHTTPError(response.status)
+                result = await response.json(content_type=None)
         except TimeoutError as err:
             raise TrimlightConnectionError("request timed out") from err
         except ClientError as err:
             raise TrimlightConnectionError("request failed") from err
-
-        try:
-            self._raise_for_http_status(response)
-            try:
-                result = await response.json(content_type=None)
-            except TimeoutError as err:
-                raise TrimlightConnectionError("request timed out") from err
-            except ClientError as err:
-                raise TrimlightConnectionError("request failed") from err
-            except (json.JSONDecodeError, UnicodeDecodeError) as err:
-                raise TrimlightProtocolError("response is not valid JSON") from err
-        finally:
-            response.release()
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            raise TrimlightProtocolError("response is not valid JSON") from err
 
         if not isinstance(result, dict):
             raise TrimlightProtocolError("response must be an object")
@@ -405,9 +411,3 @@ class TrimlightClient:
                 message if isinstance(message, str) else None,
             )
         return result
-
-    @staticmethod
-    def _raise_for_http_status(response: ClientResponse) -> None:
-        """Raise a client error for a non-success HTTP status."""
-        if response.status < 200 or response.status >= 300:
-            raise TrimlightHTTPError(response.status)

@@ -51,6 +51,8 @@ async def main() -> None:
             warm_white=0,
             cold_white=0,
         )
+        state = await client.get_light_state()
+        print(state)
 
 
 asyncio.run(main())

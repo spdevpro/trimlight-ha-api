@@ -19,7 +19,7 @@ async def async_main(host: str, brightness: int) -> None:
             f"firmware={device_info.firmware_version}",
             f"ic={device_info.ic_type.name}",
         )
-        state = await client.set_light_state(
+        await client.set_light_state(
             on=True,
             brightness=brightness,
             red=255,
@@ -28,6 +28,7 @@ async def async_main(host: str, brightness: int) -> None:
             warm_white=0,
             cold_white=0,
         )
+        state = await client.get_light_state()
         print(f"Controller reported state: {state}")
 
 
