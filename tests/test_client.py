@@ -21,15 +21,18 @@ from aiotrimlight import (
     TrimlightClient,
     TrimlightCommandError,
     TrimlightConnectionError,
+    TrimlightDeviceInfo,
     TrimlightHTTPError,
     TrimlightICType,
     TrimlightLightState,
     TrimlightOutputMode,
     TrimlightProtocolError,
     TrimlightZoneState,
+    parse_discovery_properties,
 )
 
 HOST = "192.0.2.10"
+VALID_DID = "544c0003a1b2c3d4e5f6"
 
 
 def make_response(
@@ -214,7 +217,11 @@ async def test_get_device_info_uses_runtime_ic(
             {
                 "code": 0,
                 "data": {
-                    "sys_info": {"firmware_version": "1.2.3"},
+                    "sys_info": {
+                        "firmware_version": "1.2.3",
+                        "did": VALID_DID,
+                        "device_name": "Test controller",
+                    },
                     "light_config": {"ic": 99},
                 },
             }
@@ -224,8 +231,13 @@ async def test_get_device_info_uses_runtime_ic(
 
     info = await client.get_device_info()
 
-    assert info.firmware_version == "1.2.3"
-    assert info.ic_type is expected
+    assert info == TrimlightDeviceInfo(
+        firmware_version="1.2.3",
+        ic_type=expected,
+        did=VALID_DID,
+        device_name="Test controller",
+    )
+    assert post.await_count == 2
     assert post.await_args_list[0].kwargs["json"]["cmd"] == "get_device_data"
     assert isinstance(post.await_args_list[0].kwargs["json"]["data"]["timestamp"], int)
     assert post.await_args_list[1].kwargs["json"] == {
@@ -234,10 +246,43 @@ async def test_get_device_info_uses_runtime_ic(
     }
 
 
+@pytest.mark.parametrize("name", ["", "  ", " Test controller ", "客厅灯"])
+async def test_get_device_info_normalizes_did_and_preserves_name(name: str) -> None:
+    """Test HTTP identity matches discovery while names remain unmodified."""
+    client, _ = make_client(
+        make_response(
+            {
+                "code": 0,
+                "data": {"sys_info": {"did": VALID_DID.upper(), "device_name": name}},
+            }
+        ),
+        runtime_response(),
+    )
+
+    info = await client.get_device_info()
+    discovery = parse_discovery_properties({"did": VALID_DID.upper()})
+
+    assert info.did == discovery.did == VALID_DID
+    assert info.mac_address == discovery.mac_address == "a1:b2:c3:d4:e5:f6"
+    assert info.device_name == name
+    assert info.firmware_version is None
+
+
 async def test_get_device_info_rejects_unknown_runtime_ic() -> None:
     """Test rejecting an invalid light IC reported at runtime."""
     client, _ = make_client(
-        make_response({"code": 0, "data": {"sys_info": {"firmware_version": "1.2.3"}}}),
+        make_response(
+            {
+                "code": 0,
+                "data": {
+                    "sys_info": {
+                        "firmware_version": "1.2.3",
+                        "did": VALID_DID,
+                        "device_name": "Test controller",
+                    }
+                },
+            }
+        ),
         runtime_response(ic=3),
     )
 
@@ -848,10 +893,78 @@ async def test_device_info_shape_errors(
     payload: dict[str, object], message: str
 ) -> None:
     """Test rejecting malformed device information."""
-    client, _ = make_client(make_response(payload))
+    client, post = make_client(make_response(payload))
 
     with pytest.raises(TrimlightProtocolError, match=message):
         await client.get_device_info()
+
+    post.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("identity", "message"),
+    [
+        pytest.param({}, "did must be a string", id="missing-did"),
+        pytest.param({"did": None}, "did must be a string", id="null-did"),
+        pytest.param({"did": 123}, "did must be a string", id="integer-did"),
+        pytest.param({"did": True}, "did must be a string", id="boolean-did"),
+        pytest.param(
+            {"did": ""},
+            "did must be 20 hexadecimal characters",
+            id="empty-did",
+        ),
+        pytest.param(
+            {"did": VALID_DID[:-1]},
+            "did must be 20 hexadecimal characters",
+            id="short-did",
+        ),
+        pytest.param(
+            {"did": VALID_DID + "0"},
+            "did must be 20 hexadecimal characters",
+            id="long-did",
+        ),
+        pytest.param(
+            {"did": VALID_DID[:-1] + "g"},
+            "did must be 20 hexadecimal characters",
+            id="non-hex-did",
+        ),
+        pytest.param(
+            {"did": " " + VALID_DID + " "},
+            "did must be 20 hexadecimal characters",
+            id="whitespace-did",
+        ),
+        pytest.param(
+            {"did": VALID_DID}, "device_name must be a string", id="missing-name"
+        ),
+        pytest.param(
+            {"did": VALID_DID, "device_name": None},
+            "device_name must be a string",
+            id="null-name",
+        ),
+        pytest.param(
+            {"did": VALID_DID, "device_name": 123},
+            "device_name must be a string",
+            id="integer-name",
+        ),
+        pytest.param(
+            {"did": VALID_DID, "device_name": False},
+            "device_name must be a string",
+            id="boolean-name",
+        ),
+    ],
+)
+async def test_device_info_identity_errors(
+    identity: dict[str, object], message: str
+) -> None:
+    """Test invalid identity stops before runtime I/O."""
+    client, post = make_client(
+        make_response({"code": 0, "data": {"sys_info": identity}})
+    )
+
+    with pytest.raises(TrimlightProtocolError, match=message):
+        await client.get_device_info()
+
+    post.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

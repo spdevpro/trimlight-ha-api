@@ -10,6 +10,7 @@ from typing import Any
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from yarl import URL
 
+from .discovery import _DID_PATTERN
 from .exceptions import (
     TrimlightCommandError,
     TrimlightConnectionError,
@@ -110,9 +111,24 @@ class TrimlightClient:
             if firmware_version is not None and not isinstance(firmware_version, str):
                 raise TrimlightProtocolError("firmware_version must be a string")
 
+            did = sys_info.get("did")
+            if not isinstance(did, str):
+                raise TrimlightProtocolError("did must be a string")
+            if _DID_PATTERN.fullmatch(did) is None:
+                raise TrimlightProtocolError("did must be 20 hexadecimal characters")
+
+            device_name = sys_info.get("device_name")
+            if not isinstance(device_name, str):
+                raise TrimlightProtocolError("device_name must be a string")
+
             runtime_state = await self._get_runtime_state()
 
-        return TrimlightDeviceInfo(firmware_version, runtime_state.ic_type)
+        return TrimlightDeviceInfo(
+            firmware_version=firmware_version,
+            ic_type=runtime_state.ic_type,
+            did=did.lower(),
+            device_name=device_name,
+        )
 
     async def get_light_state(self) -> TrimlightLightState:
         """Return the whole-installation state reported by the controller."""
