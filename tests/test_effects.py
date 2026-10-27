@@ -8,7 +8,13 @@ from unittest.mock import Mock
 
 import pytest
 from aiohttp import ClientConnectionError
-from test_client import make_client, make_response, runtime_response, static_record
+from test_client import (
+    VALID_DID,
+    make_client,
+    make_response,
+    runtime_response,
+    static_record,
+)
 from yarl import URL
 
 from aiotrimlight import (
@@ -431,7 +437,17 @@ async def test_play_serializes_with_other_operations(operation: str) -> None:
         if command == "get_effect_list":
             return effect_response()
         if command == "get_device_data":
-            return make_response({"code": 0, "data": {"sys_info": {}}})
+            return make_response(
+                {
+                    "code": 0,
+                    "data": {
+                        "sys_info": {
+                            "did": VALID_DID,
+                            "device_name": "Test controller",
+                        }
+                    },
+                }
+            )
         return make_response()
 
     client, post = make_client()

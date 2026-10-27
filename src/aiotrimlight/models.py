@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 
+def _mac_address_from_did(did: str) -> str:
+    """Return the controller MAC address encoded in the DID."""
+    mac = did[-12:].lower()
+    return ":".join(mac[index : index + 2] for index in range(0, 12, 2))
+
+
 class TrimlightICType(IntEnum):
     """Trimlight light IC capability."""
 
@@ -47,8 +53,7 @@ class TrimlightDiscoveryInfo:
     @property
     def mac_address(self) -> str:
         """Return the controller MAC address encoded in the DID."""
-        mac = self.did[-12:].lower()
-        return ":".join(mac[index : index + 2] for index in range(0, 12, 2))
+        return _mac_address_from_did(self.did)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +62,13 @@ class TrimlightDeviceInfo:
 
     firmware_version: str | None
     ic_type: TrimlightICType
+    did: str
+    device_name: str
+
+    @property
+    def mac_address(self) -> str:
+        """Return the controller MAC address encoded in the DID."""
+        return _mac_address_from_did(self.did)
 
 
 @dataclass(frozen=True, slots=True)
